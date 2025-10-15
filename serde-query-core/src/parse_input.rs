@@ -1,5 +1,4 @@
 use proc_macro_error::{diagnostic, Diagnostic, Level};
-use quote::ToTokens;
 use syn::{DeriveInput, LitStr};
 
 use crate::{
@@ -67,11 +66,7 @@ pub(crate) fn parse_input(input: &mut DeriveInput) -> ParseResult {
                         for error in errors {
                             diagnostics.push(diagnostic!(attr, Level::Error, error.message));
                         }
-                        Some(Query::new(
-                            QueryId::new(ident),
-                            fragment,
-                            field.ty.to_token_stream(),
-                        ))
+                        Some(Query::new(QueryId::new(ident), fragment, field.ty.clone()))
                     }
                 }
             })

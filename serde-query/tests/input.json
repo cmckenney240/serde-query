@@ -5,7 +5,8 @@
     "author": {
       "name": "Maximilian Roos",
       "email": "5635139+max-sixty@users.noreply.github.com",
-      "date": "2020-03-29T21:40:42Z"
+      "date": "2020-03-29T21:40:42Z",
+      "organizations": []
     },
     "committer": {
       "name": "William Langford",
@@ -77,3 +78,4 @@
     }
   ]
 }
+

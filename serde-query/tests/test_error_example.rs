@@ -26,7 +26,7 @@ fn test_error_example() {
 Queries failed for fields: 'author_name', 'committer_name', 'id'
   1. Query for field 'author_name' failed at '.author': missing field 'name'
   2. Query for field 'committer_name' failed at '.commit': missing field 'commiter'
-  3. Query for field 'id' failed at '.author.id': invalid type: integer `5635139`, expected a string at line 34 column 17
+  3. Query for field 'id' failed at '.author.id': invalid type: integer `5635139`, expected a string at line 35 column 17
 "#
         .trim_start()
     );

@@ -1,5 +1,3 @@
-use proc_macro2::TokenStream;
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum QueryFragment {
     Accept,
@@ -62,11 +60,11 @@ impl QueryId {
 pub(crate) struct Query {
     pub(crate) id: QueryId,
     pub(crate) fragment: QueryFragment,
-    pub(crate) ty: TokenStream,
+    pub(crate) ty: syn::Type,
 }
 
 impl Query {
-    pub(crate) fn new(id: QueryId, fragment: QueryFragment, ty: TokenStream) -> Self {
+    pub(crate) fn new(id: QueryId, fragment: QueryFragment, ty: syn::Type) -> Self {
         Self { id, fragment, ty }
     }
 }

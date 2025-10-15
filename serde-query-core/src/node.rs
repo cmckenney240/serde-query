@@ -104,13 +104,101 @@ impl NodeKind {
 #[derive(Debug)]
 pub(crate) struct Node {
     name: String,
-    // map of (id, ty)
-    queries: BTreeMap<QueryId, TokenStream>,
+    // map of (id, QueryInfo)
+    queries: BTreeMap<QueryId, QueryInfo>,
     kind: NodeKind,
 
     // fields for diagnostics
     /// The prefix of the queries to reach this node.
     prefix: String,
+}
+
+#[derive(Debug)]
+struct QueryInfo {
+    ty: syn::Type,  // the fields target type
+    optional: bool, // true if field type is Option<...>
+}
+
+pub fn strip_wrappers(mut ty: &syn::Type) -> &syn::Type {
+    loop {
+        ty = match ty {
+            syn::Type::Reference(r) => &r.elem,
+            syn::Type::Group(g) => &g.elem,
+            syn::Type::Paren(p) => &p.elem,
+            _ => break ty,
+        }
+    }
+}
+
+pub fn option_inner(ty: &syn::Type) -> Option<&syn::Type> {
+    let ty = strip_wrappers(ty);
+
+    let seg = last_segment(ty)?;
+    if seg.ident != "Option" {
+        return None;
+    }
+
+    match &seg.arguments {
+        syn::PathArguments::AngleBracketed(args) => {
+            if args.args.len() != 1 {
+                return None;
+            }
+            match args.args.first().unwrap() {
+                syn::GenericArgument::Type(ty) => Some(ty),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn last_segment(ty: &syn::Type) -> Option<&syn::PathSegment> {
+    match strip_wrappers(ty) {
+        syn::Type::Path(tp) => tp.path.segments.last(),
+        _ => None,
+    }
+}
+
+pub fn is_option(ty: &syn::Type) -> bool {
+    option_inner(ty).is_some()
+}
+
+pub fn is_sequence_container_ident(ident: &syn::Ident) -> bool {
+    matches!(
+        ident.to_string().as_str(),
+        "Vec" | "HashSet" | "BTreeSet" | "LinkedList" | "VecDeque"
+    )
+}
+
+pub fn sequence_container_inner(ty: &syn::Type) -> Option<&syn::Type> {
+    let seg = last_segment(ty)?;
+    if !is_sequence_container_ident(&seg.ident) {
+        return None;
+    }
+    match &seg.arguments {
+        syn::PathArguments::AngleBracketed(args) => args.args.iter().find_map(|arg| {
+            if let syn::GenericArgument::Type(inner) = arg {
+                Some(inner)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
+}
+
+pub fn unwrap_option_sequence_container(ty: &syn::Type) -> Option<syn::Type> {
+    if let Some(inner) = option_inner(ty) {
+        if sequence_container_inner(inner).is_some() {
+            return Some(inner.clone()); // Option<Container<_>> -> Container<_>
+        }
+        return None; // Option<NonContainer>
+    }
+
+    if sequence_container_inner(ty).is_some() {
+        return Some(ty.clone()); // alrea a Container<_>
+    }
+    None
 }
 
 impl Node {
@@ -148,14 +236,21 @@ impl Node {
         env: &mut Env,
         id: QueryId,
         fragment: QueryFragment,
-        ty: TokenStream,
+        ty: syn::Type,
         prefix: String,
     ) -> Self {
+        let optional_ty = is_option(&ty);
         let name = env.new_node_name();
         match fragment {
             QueryFragment::Accept => Self {
                 name,
-                queries: BTreeMap::from_iter([(id, ty)]),
+                queries: BTreeMap::from_iter([(
+                    id,
+                    QueryInfo {
+                        ty,
+                        optional: optional_ty,
+                    },
+                )]),
                 kind: NodeKind::Accept,
                 prefix,
             },
@@ -175,7 +270,13 @@ impl Node {
                 };
                 Self {
                     name,
-                    queries: BTreeMap::from_iter([(id, ty)]),
+                    queries: BTreeMap::from_iter([(
+                        id,
+                        QueryInfo {
+                            ty,
+                            optional: optional_ty,
+                        },
+                    )]),
                     kind,
                     prefix,
                 }
@@ -193,24 +294,39 @@ impl Node {
                 };
                 Self {
                     name,
-                    queries: BTreeMap::from_iter([(id, ty)]),
+                    queries: BTreeMap::from_iter([(
+                        id,
+                        QueryInfo {
+                            ty,
+                            optional: optional_ty,
+                        },
+                    )]),
                     kind,
                     prefix,
                 }
             }
             QueryFragment::CollectArray { rest } => {
-                let element_ty = quote::quote!(<#ty as serde_query::__priv::Container>::Element);
+                let container_ty: syn::Type = unwrap_option_sequence_container(&ty).expect("CollectArray requires sequence container type (Vec, HashSet, BTreeSet, LinkedList, VecDeque) or Option<Container>.");
+                let element_ty =
+                    quote::quote!(<#container_ty as serde_query::__priv::Container>::Element);
+                let element_ty_ast: syn::Type = syn::parse2(element_ty).unwrap();
                 let child = Box::new(Self::from_query(
                     env,
                     id.clone(),
                     *rest,
-                    element_ty,
+                    element_ty_ast,
                     format!("{}.[]", prefix),
                 ));
                 let kind = NodeKind::CollectArray { child };
                 Self {
                     name,
-                    queries: BTreeMap::from_iter([(id, ty)]),
+                    queries: BTreeMap::from_iter([(
+                        id,
+                        QueryInfo {
+                            ty,
+                            optional: optional_ty,
+                        },
+                    )]),
                     kind,
                     prefix,
                 }
@@ -248,16 +364,39 @@ impl Node {
         self.queries.keys().map(QueryId::ident).collect()
     }
 
-    fn query_types(&self) -> Vec<&TokenStream> {
-        self.queries.values().collect()
+    fn query_types(&self) -> Vec<&syn::Type> {
+        self.queries.values().map(|info| &info.ty).collect()
+    }
+
+    fn query_optionals(&self) -> Vec<bool> {
+        self.queries.values().map(|info| info.optional).collect()
     }
 
     fn missing_fields_error_triple<K: Clone + Ord>(
+        &self,
         children: &BTreeMap<K, Node>,
     ) -> (Vec<K>, Vec<syn::Ident>, Vec<String>) {
-        let mut keys = vec![];
-        let mut idents = vec![];
-        let mut ident_strings = vec![];
+        let mut qid_to_key: BTreeMap<QueryId, K> = BTreeMap::new();
+        for (key, child) in children {
+            for qid in child.queries.keys() {
+                qid_to_key.insert(qid.clone(), key.clone());
+            }
+        }
+
+        let mut keys = Vec::with_capacity(self.queries.len());
+        let mut idents = Vec::with_capacity(self.queries.len());
+        let mut ident_strings = Vec::with_capacity(self.queries.len());
+
+        for qid in self.queries.keys() {
+            let key = qid_to_key
+                .get(qid)
+                .expect("query id from self.queries must be preset in children")
+                .clone();
+            let ident = qid.ident().clone();
+            keys.push(key);
+            idents.push(ident.clone());
+            ident_strings.push(ident.to_string());
+        }
 
         for (field, node) in children.iter() {
             for id in node.queries.keys() {
@@ -288,7 +427,8 @@ impl Node {
                         second_ident,
                     ));
                 }
-                let (query_id, query_type) = self.queries.first_key_value().unwrap();
+                let (query_id, query_info) = self.queries.first_key_value().unwrap();
+                let query_type = &query_info.ty;
                 let query_name = query_id.ident();
 
                 let deserialize_seed_ty = self.deserialize_seed_ty();
@@ -333,6 +473,8 @@ impl Node {
 
                 let query_names = self.query_names();
                 let query_types = self.query_types();
+                let query_optionals = self.query_optionals();
+                let idxs: Vec<syn::Index> = (0..query_types.len()).map(syn::Index::from).collect();
 
                 let field_ids: Vec<_> = (0..fields.len())
                     .map(|idx| quote::format_ident!("Field{}", idx))
@@ -343,11 +485,12 @@ impl Node {
                     .map(|name| Literal::byte_string(name.as_bytes()))
                     .collect();
 
-                let (missing_field_names, missing_query_names, missing_query_name_strings) =
-                    Self::missing_fields_error_triple(fields);
-                let missing_field_error_messages = missing_field_names
+                let (missing_keys, missing_query_names, missing_query_name_strings) =
+                    self.missing_fields_error_triple(fields);
+                let missing_field_error_messages = missing_keys
                     .into_iter()
-                    .map(|field_name| format!("missing field '{}'", field_name));
+                    .map(|key| format!("missing field '{}'", key));
+
                 let prefix = &self.prefix;
 
                 let match_arms =
@@ -425,6 +568,7 @@ impl Node {
                         where
                             D: serde_query::__priv::serde::Deserializer<'de>,
                         {
+                            let optionals = [#(#query_optionals),*];
                             let visitor = #visitor_ty {
                                 #(
                                     #query_names: self.#query_names,
@@ -433,15 +577,23 @@ impl Node {
                             deserializer.deserialize_map(visitor)?;
                             #(
                                 if self.#missing_query_names.is_none() {
-                                    *self.#missing_query_names = core::option::Option::Some(
-                                        core::result::Result::Err(
-                                            serde_query::__priv::Error::borrowed(
-                                                #missing_query_name_strings,
-                                                #prefix,
-                                                #missing_field_error_messages,
-                                            )
+                                    if optionals[#idxs] {
+                                        // Option<T> -> treat missing as Ok(None)
+                                        *self.#missing_query_names = core::option::Option::Some(
+                                            core::result::Result::Ok(<#query_types as core::default::Default>::default())
                                         )
-                                    );
+                                    }
+                                    else {
+                                        *self.#missing_query_names = core::option::Option::Some(
+                                            core::result::Result::Err(
+                                                serde_query::__priv::Error::borrowed(
+                                                    #missing_query_name_strings,
+                                                    #prefix,
+                                                    #missing_field_error_messages,
+                                                )
+                                            )
+                                        );
+                                    }
                                 }
                             )*
 
@@ -542,6 +694,8 @@ impl Node {
 
                 let query_names = self.query_names();
                 let query_types = self.query_types();
+                let query_optionals = self.query_optionals();
+                let idxs: Vec<syn::Index> = (0..query_types.len()).map(syn::Index::from).collect();
 
                 let match_arms = indices.iter().map(|(index, node)| {
                     let deserialize_seed_ty = node.deserialize_seed_ty();
@@ -562,7 +716,7 @@ impl Node {
                 });
 
                 let (missing_field_names, missing_query_names, missing_query_name_strings) =
-                    Self::missing_fields_error_triple(indices);
+                    self.missing_fields_error_triple(indices);
                 let missing_field_error_messages = missing_field_names
                     .into_iter()
                     .map(|index| format!("the sequence must have at least {} elements", index + 1));
@@ -597,6 +751,7 @@ impl Node {
                         where
                             D: serde_query::__priv::serde::Deserializer<'de>,
                         {
+                            let optionals = [#(#query_optionals),*];
                             let visitor = #visitor_ty {
                                 #(
                                     #query_names: self.#query_names,
@@ -605,15 +760,23 @@ impl Node {
                             deserializer.deserialize_seq(visitor)?;
                             #(
                                 if self.#missing_query_names.is_none() {
-                                    *self.#missing_query_names = core::option::Option::Some(
-                                        core::result::Result::Err(
-                                            serde_query::__priv::Error::borrowed(
-                                                #missing_query_name_strings,
-                                                #prefix,
-                                                #missing_field_error_messages,
-                                            )
+                                    if optionals[#idxs] {
+                                        // Option<T> -> treat missing as Ok(None)
+                                        *self.#missing_query_names = core::option::Option::Some(
+                                            core::result::Result::Ok(<#query_types as core::default::Default>::default())
                                         )
-                                    );
+                                    }
+                                    else {
+                                        *self.#missing_query_names = core::option::Option::Some(
+                                            core::result::Result::Err(
+                                                serde_query::__priv::Error::borrowed(
+                                                    #missing_query_name_strings,
+                                                    #prefix,
+                                                    #missing_field_error_messages,
+                                                )
+                                            )
+                                        );
+                                    }
                                 }
                             )*
                             core::result::Result::Ok(())
@@ -669,6 +832,27 @@ impl Node {
                 let query_names = self.query_names();
                 let query_types = self.query_types();
 
+                let container_tys: Vec<syn::Type> = self.queries.values().map(|q| {
+                    unwrap_option_sequence_container(&q.ty).expect("CollectArray requires sequence container type (Vec, HashSet, BTreeSet, LinkedList, VecDeque) or Option<Container>.")
+                }).collect();
+
+                let wrap_flags: Vec<bool> = self
+                    .queries
+                    .values()
+                    .map(|q| option_inner(&q.ty).is_some())
+                    .collect();
+
+                let mut wrap_names = Vec::new();
+                let mut plain_names = Vec::new();
+
+                for (name, wrap) in query_names.iter().zip(wrap_flags.iter()) {
+                    if *wrap {
+                        wrap_names.push(name);
+                    } else {
+                        plain_names.push(name);
+                    }
+                }
+
                 let child_code = child.generate()?;
                 let child_deserialize_seed_ty = child.deserialize_seed_ty();
                 // child_query_names should be equal to those of self
@@ -694,7 +878,7 @@ impl Node {
                         {
                             #(
                                 let mut #query_names = core::result::Result::Ok(
-                                    <#query_types as serde_query::__priv::Container>::empty()
+                                    <#container_tys as serde_query::__priv::Container>::empty()
                                 );
                             )*
                             let visitor = #visitor_ty {
@@ -704,7 +888,13 @@ impl Node {
                             };
                             deserializer.deserialize_seq(visitor)?;
                             #(
-                                *self.#query_names = core::option::Option::Some(#query_names);
+                                *self.#query_names = core::option::Option::Some(
+                                    #wrap_names.map(core::option::Option::Some)
+                                );
+                            )*
+
+                            #(
+                                *self.#plain_names = core::option::Option::Some(#plain_names);
                             )*
                             core::result::Result::Ok(())
                         }
@@ -712,7 +902,7 @@ impl Node {
 
                     struct #visitor_ty<'query> {
                         #(
-                            #query_names: &'query mut core::result::Result<#query_types, serde_query::__priv::Error>,
+                            #query_names: &'query mut core::result::Result<#container_tys, serde_query::__priv::Error>,
                         )*
                     }
 
@@ -729,7 +919,7 @@ impl Node {
                         {
                             if let core::option::Option::Some(additional) = seq.size_hint() {
                                 #(
-                                    <#query_types as serde_query::__priv::Container>::reserve(
+                                    <#container_tys as serde_query::__priv::Container>::reserve(
                                         self.#query_names.as_mut().unwrap(),
                                         additional,
                                     );
@@ -750,7 +940,7 @@ impl Node {
                                             match &mut self.#query_names {
                                                 core::result::Result::Ok(ref mut container) => match #query_names {
                                                     core::option::Option::Some(core::result::Result::Ok(v)) => {
-                                                        <#query_types as serde_query::__priv::Container>::extend_one(
+                                                        <#container_tys as serde_query::__priv::Container>::extend_one(
                                                             container,
                                                             v,
                                                         )
